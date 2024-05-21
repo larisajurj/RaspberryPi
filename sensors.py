@@ -8,27 +8,18 @@ from adafruit_ads1x15.analog_in import AnalogIn
 import adafruit_ads1x15.ads1015 as ADS
 import threading
 import firebase_admin
-from firebase_admin import credentials
-from firebase_admin import firestore
-
-# Use a service account.
-cred = credentials.Certificate('private-key.json')
-
-app = firebase_admin.initialize_app(cred)
-
-db = firestore.client()
+from firebase_admin import credentials, db, firestore
+from gpiozero import PWMLED
 
 
+cred = credentials.Certificate("firebase-key.json")
+firebase_admin.initialize_app(cred, {
+    'databaseURL': 'https://rpi-lab-project-default-rtdb.firebaseio.com/'
+})
 
-#FIREBASE SETUP
-config = {
-    "apiKey": "AIzaSyC1d-x5s-DHPTIzARn7A59Kt8QjAfakO-s",
-    "authDomain": "rpi-lab-project",
-    "databaseURL": "https://rpi-lab-project-default-rtdb.firebaseio.com/",
-    "storageBucket": "rpi-dht-monitor.appspot.com"
-}
-#firebase = pyrebase.initialize_app(config)
-#db = firebase.database()
+
+db_firestore =  firestore.client()
+
 
 #LCD SETUP
 lcd = CharLCD(i2c_expander='PCF8574', address=0x27, port=3, cols=16, rows=2, dotsize=8)
@@ -128,7 +119,7 @@ lcd.create_char(7, strop2)
 
 # Clear the display again after creating characters
 lcd.clear()
-
+lcd.write_string("Your smart greenhouse!")
 # Set cursor to desired position
 lcd.cursor_pos = (0, 0)
 
@@ -143,17 +134,21 @@ GPIO.setmode(GPIO.BCM)
 ldr_pin = 22 
 GPIO.setup(ldr_pin, GPIO.IN)
 
-#BLUE LED SETUP
-blue_led_pin = 26
-GPIO.setup(blue_led_pin, GPIO.OUT)
+#GREEN LED SETUP
+green_led_pin = 26
+green_led = PWMLED(green_led_pin)
+
+#WHITE LED SETUP
+white_led_pin = 19
+GPIO.setup(white_led_pin, GPIO.OUT)
 
 #YELLOW LED SETUP
-yellow_led_pin = 19
-GPIO.setup(yellow_led_pin, GPIO.OUT)
+yellow_led_pin = 6
+yellow_led = PWMLED(yellow_led_pin)
 
 #RED LED SETUP
-red_led_pin = 19
-GPIO.setup(red_led_pin, GPIO.OUT)
+red_led_pin = 13
+red_led = PWMLED(red_led_pin)
 
 #BUTTON SETUP
 button_pin = 21
@@ -167,34 +162,31 @@ chan = AnalogIn(ads, ADS.P0)
 minValue = 8000  # Corresponds to super wet
 maxValue = 26300 # Corresponds to super dry
 
-#Defining the duration between actions
-time_realtime_db = 5 #data will be send to realtime db every 5 sec
-time_firestore = 6 #data will be send to firestore evry 5*6 sec
-
 def button_handler():
     while True:
         if GPIO.input(button_pin) == GPIO.HIGH:
             print("Button was pushed!")
 
             # Toggle LED state
-            if GPIO.input(yellow_led_pin) == GPIO.LOW:
-                GPIO.output(yellow_led_pin, GPIO.HIGH)
+            if GPIO.input(white_led_pin) == GPIO.LOW:
+                GPIO.output(white_led_pin, GPIO.HIGH)
             else:
-                GPIO.output(yellow_led_pin, GPIO.LOW)
+                GPIO.output(white_led_pin, GPIO.LOW)
 
             time.sleep(1)
         
 def sensor_monitor():
+    count = 0
+    firestore_count = 0
     while True:
         try:
             #The "Light LED" data in firebase is set on true from the
             #app when the user presses the button
             #At the start of each cycle we check that value to be
-            #light up the LED if needed 
+            #light up the LED if needed
             
-            #light_led = db.child("Light_LED").get().val()        
-            light_led = realtime_db.reference('Light_LED').get()
-
+            #light_led = db.child("Light_LED").get().val()
+            light_led = db.reference('Light_LED').get()    
             sensorValue = chan.value
             wetnessScore = 1 + 9 * (maxValue - sensorValue) / (maxValue - minValue)
             if wetnessScore < 1:
@@ -222,11 +214,7 @@ def sensor_monitor():
 
             if light_led:
                 print("Service needed called")
-                GPIO.output(blue_led_pin, GPIO.HIGH)
-            else:
-                print("Water Detected!")
-                GPIO.output(blue_led_pin, GPIO.LOW)
-            
+                
             data = {
             "Light_detected" : not light_state,
             "Water_detected" : round(wetnessScore,2),
@@ -234,18 +222,48 @@ def sensor_monitor():
             "Humidity" : humidity
             }
             
-            lcd.clear()
-
+            print('count is ' + str(count))
             if light_led:
                 LCD_print("user_called", 0,0,0,0)
-            else:
+                count = 0
+            elif count == 2:
                 LCD_print("status", not light_state, humidity, temperature_c, round(wetnessScore))
+                count = 0
             #db.child("Status").push(data)
             #db.update(data)
-            realtime_db.reference('Status').push(data)
-            realtime_db.reference().update(data)
+            
+            
+            if wetnessScore < 4:
+                led = red_led
+            elif wetnessScore < 7:
+                led = yellow_led
+            else:
+                led = green_led
+            
+            for duty_cycle in range(0, 100, 1):
+                led.value = duty_cycle/100.0
+                time.sleep(0.01)
 
-            time.sleep(5)
+            #fade out
+            for duty_cycle in range(100, 0, -1):
+                led.value = duty_cycle/100.0
+                time.sleep(0.01)
+                
+            led.value = 0;
+
+            
+            db.reference('Light_detected').set(not light_state)
+            db.reference('Water_detected').set(round(wetnessScore,2))
+            db.reference('Temp').set(temperature_c)
+            db.reference('Humidity').set(humidity)
+            
+            if firestore_count == 45:
+                send_to_firestore(humidity, temperature_c, round(wetnessScore,2), not light_state)
+                firestore_count = 0
+                print("Sent data to firestore")
+            count = count + 1
+            firestore_count = firestore_count + 1
+            time.sleep(1)
 
         except RuntimeError as error:
             # Errors happen fairly often, DHT's are hard to read, just keep going
@@ -258,15 +276,17 @@ def sensor_monitor():
         except KeyboardInterrupt as error:
             GPIO.cleanup()
 
-def send_to_firestore(humidity, temperature_c, wetnessScore, light_state):
+def send_to_firestore(humidity, temperature_c, wetnessScore, light):
     firestore_data = {
                 "sampling_time": firestore.SERVER_TIMESTAMP,
                 "humidity": humidity,
                 "temperature": temperature_c,
                 "wetness_score": wetnessScore,
-                "light": not light_state
+                "light": light
             }
-    db_firestore.collection('SensorData').add(firestore_data)
+    db_firestore.collection('greenhouse-data').add(firestore_data)
+
+    
     
     
 #We define a function manage the display
@@ -275,6 +295,7 @@ def send_to_firestore(humidity, temperature_c, wetnessScore, light_state):
 #   2. status: the normal mode, displays the data from sensors
 
 def LCD_print(alert_type, light, humidity, temp, wetnessScore):
+    lcd.clear()
     if alert_type == "user_called":
         lcd.write_string('Service needed!')
     else:
@@ -315,10 +336,21 @@ def LCD_print(alert_type, light, humidity, temp, wetnessScore):
         lcd.write_string('\x04')
         lcd.write_string('\x05:')
         lcd.write_string(temp_string)
+
+def led_indicators():
+    while True:
+        wetnessScore = 1 + 9 * (maxValue - sensorValue) / (maxValue - minValue)
+        if wetnessScore < 1:
+            wetnessScore = 1
+        elif wetnessScore > 10:
+            wetnessScore = 10
+        print('weeeeeet' + str(wetnessScore))
+        time.sleep(1)
         
 #Create threads for button handling and sensor monitoring
 button_thread = threading.Thread(target=button_handler)
 sensor_thread = threading.Thread(target=sensor_monitor)
+
 
 # Start the threads
 button_thread.start()
